@@ -56,6 +56,12 @@ banco.connect((erro) => {
 
 const CHAVE_SECRETA_JWT = "ChaveSecretaDoProjetoPortArt2026";
 
+// FUNÇÃO AUXILIAR: Validador de Formato de E-mail
+function emailValido(email) {
+    const regex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return regex.test(email);
+}
+
 // MIDDLEWARE DE SEGURANÇA (Verificador de Crachá/Token JWT)
 function conferirAutenticacao(req, res, next) {
     const cabecalhoAutenticacao = req.headers['authorization'];
@@ -83,21 +89,32 @@ app.get('/', (req, res) => {
 app.post('/api/usuarios', async (req, res) => {
     const { nome, email, senha, bio } = req.body;
     
+    // 1. Validação de campos obrigatórios
     if (!nome || !email || !senha) {
         return res.status(400).json({ erro: "Nome, e-mail e senha são obrigatórios!" });
     }
 
+    // 2. Validação do formato do e-mail
+    if (!emailValido(email)) {
+        return res.status(400).json({ erro: "O formato do e-mail informado é inválido!" });
+    }
+
+    // 3. Validação do tamanho da senha (mínimo 6 caracteres para segurança do artista)
+    if (senha.length < 6) {
+        return res.status(400).json({ erro: "A senha deve ter no mínimo 6 caracteres!" });
+    }
+
     try {
-        // 1. Checa se o e-mail já existe
+        // Checa se o e-mail já existe
         const checarEmail = await banco.query('SELECT id FROM usuarios WHERE email = $1', [email]);
         if (checarEmail.rows.length > 0) {
             return res.status(400).json({ erro: "Este e-mail já está cadastrado!" });
         }
 
-        // 2. Criptografa a senha
+        // Criptografa a senha
         const senhaCriptografada = await bcrypt.hash(senha, 10);
 
-        // 3. Salva o usuário na tabela 'usuarios'
+        // Salva o usuário na tabela 'usuarios'
         const novoUsuario = await banco.query(
             'INSERT INTO usuarios (nome, email, senha, bio) VALUES ($1, $2, $3, $4) RETURNING id, nome, email',
             [nome, email, senhaCriptografada, bio || 'Olá! Sou um artista no PortArt.']
@@ -105,7 +122,7 @@ app.post('/api/usuarios', async (req, res) => {
 
         const usuarioCriado = novoUsuario.rows[0];
 
-        // 4. AUTOMAÇÃO: Cria as preferências visuais padrão do portfólio dele (1 para 1)
+        // AUTOMAÇÃO: Cria as preferências visuais padrão do portfólio dele (1 para 1)
         await banco.query(
             'INSERT INTO preferencias_layout (usuario_id, cor_fundo, cor_acento, estilo_card) VALUES ($1, $2, $3, $4)',
             [usuarioCriado.id, '#FFFFFF', '#007BFF', 'moderno']
@@ -290,6 +307,47 @@ app.put('/api/conteudos/:id', conferirAutenticacao, async (req, res) => {
 });
 
 // =========================================================================
+// ❤️ ROTA: CURTIR / REMOVER CURTIDA DE UMA ARTE (PROTEGIDA)
+// =========================================================================
+app.post('/api/conteudos/:id/curtir', conferirAutenticacao, async (req, res) => {
+    const idPost = req.params.id;
+    const usuarioId = req.usuarioLogado.id;
+
+    try {
+        // 1. Verifica se a publicação de fato existe
+        const postExiste = await banco.query('SELECT id FROM conteudos WHERE id = $1', [idPost]);
+        if (postExiste.rows.length === 0) {
+            return res.status(404).json({ erro: "Publicação não encontrada!" });
+        }
+
+        // 2. Checa se o usuário já curtiu esse post antes
+        const jaCurtiu = await banco.query(
+            'SELECT id FROM curtidas WHERE usuario_id = $1 AND conteudo_id = $2',
+            [usuarioId, idPost]
+        );
+
+        if (jaCurtiu.rows.length > 0) {
+            // Se já curtiu, a gente remove a curtida (efeito toggle/descurtir)
+            await banco.query(
+                'DELETE FROM curtidas WHERE usuario_id = $1 AND conteudo_id = $2',
+                [usuarioId, idPost]
+            );
+            return res.json({ mensagem: "Curtida removida com sucesso!" });
+        } else {
+            // Se não curtiu ainda, adiciona no banco
+            await banco.query(
+                'INSERT INTO curtidas (usuario_id, conteudo_id) VALUES ($1, $2)',
+                [usuarioId, idPost]
+            );
+            return res.status(201).json({ mensagem: "Publicação curtida com sucesso!" });
+        }
+
+    } catch (erro) {
+        res.status(500).json({ erro: "Erro ao processar curtida: " + erro.message });
+    }
+});
+
+// =========================================================================
 // 🗑️ ROTA: DELETAR POSTAGEM DE CONTEÚDO (PROTEGIDA)
 // =========================================================================
 app.delete('/api/conteudos/:id', conferirAutenticacao, async (req, res) => {
@@ -317,10 +375,17 @@ app.delete('/api/conteudos/:id', conferirAutenticacao, async (req, res) => {
 });
 
 // =========================================================================
-// 🚀 ROTA DE LEITURA PÚBLICA DE CONTEÚDOS (GET - Alimentar Feed do Dante)
+// 🚀 ROTA DE LEITURA PÚBLICA DE CONTEÚDOS COM PAGINAÇÃO E LIKES
 // =========================================================================
 app.get('/api/conteudos', async (req, res) => {
+    const pagina = parseInt(req.query.pagina) || 1;
+    const limitePorPagina = 10; 
+    const quantidadeParaPular = (pagina - 1) * limitePorPagina;
+
     try {
+        const totalQuery = await banco.query('SELECT COUNT(*) FROM conteudos');
+        const totalDePostagens = parseInt(totalQuery.rows[0].count);
+
         const resultado = await banco.query(`
             SELECT 
                 conteudos.id,
@@ -328,20 +393,92 @@ app.get('/api/conteudos', async (req, res) => {
                 conteudos.descricao,
                 conteudos.midia_url,
                 conteudos.data_publicacao,
-                usuarios.nome AS nome_artista
+                usuarios.nome AS nome_artista,
+                COUNT(curtidas.id)::INTEGER AS total_curtidas
             FROM conteudos
             JOIN usuarios ON conteudos.usuario_id = usuarios.id
+            LEFT JOIN curtidas ON conteudos.id = curtidas.conteudo_id
+            GROUP BY conteudos.id, usuarios.nome
             ORDER BY conteudos.data_publicacao DESC
-        `);
+            LIMIT $1 OFFSET $2
+        `, [limitePorPagina, quantidadeParaPular]);
+
+        const totalPaginas = Math.ceil(totalDePostagens / limitePorPagina);
 
         res.json({
             status: "Sucesso",
-            totalDePostagens: resultado.rows.length,
+            paginacao: {
+                paginaAtual: pagina,
+                totalPaginas: totalPaginas,
+                totalItens: totalDePostagens,
+                itensPorPagina: limitePorPagina
+            },
             postagens: resultado.rows
         });
 
     } catch (erro) {
         res.status(500).json({ status: "Erro ao buscar os conteúdos", detalhe: erro.message });
+    }
+});
+
+// =========================================================================
+// 🔍 ROTA: BUSCAR PERFIL COMPLETO DO ARTISTA (PÚBLICA - Para o Portfólio)
+// =========================================================================
+app.get('/api/usuarios/:id', async (req, res) => {
+    const idArtista = req.params.id;
+
+    try {
+        // 1. Busca os dados públicos básicos do artista
+        const usuarioQuery = await banco.query(
+            'SELECT id, nome, bio, data_criacao FROM usuarios WHERE id = $1',
+            [idArtista]
+        );
+
+        if (usuarioQuery.rows.length === 0) {
+            return res.status(404).json({ erro: "Artista não encontrado no PortArt!" });
+        }
+
+        const artista = usuarioQuery.rows[0];
+
+        // 2. Busca as preferências de layout dele (cores e estilo)
+        const layoutQuery = await banco.query(
+            'SELECT cor_fundo, cor_acento, estilo_card FROM preferencias_layout WHERE usuario_id = $1',
+            [idArtista]
+        );
+
+        // 3. Busca as redes sociais vinculadas por ele
+        const redesQuery = await banco.query(
+            'SELECT id, nome_plataforma, perfil_url FROM redes_sociais WHERE usuario_id = $1',
+            [idArtista]
+        );
+
+        // 4. Busca todas as publicações/artes desse artista específico (Atualizado com total_curtidas!)
+        const conteudosQuery = await banco.query(`
+            SELECT 
+                conteudos.id, 
+                conteudos.titulo, 
+                conteudos.descricao, 
+                conteudos.midia_url, 
+                conteudos.data_publicacao,
+                COUNT(curtidas.id)::INTEGER AS total_curtidas
+            FROM conteudos 
+            LEFT JOIN curtidas ON conteudos.id = curtidas.conteudo_id
+            WHERE conteudos.usuario_id = $1 
+            GROUP BY conteudos.id
+            ORDER BY conteudos.data_publicacao DESC
+        `, [idArtista]);
+
+        res.json({
+            status: "Sucesso",
+            artista: artista,
+            layout: layoutQuery.rows[0] || { cor_fundo: "#FFFFFF", cor_acento: "#007BFF", estilo_card: "moderno" }, 
+            redesSociais: redesQuery.rows,
+            postagens: conteudosQuery.rows
+        });
+
+    } catch (erro) {
+        console.error("Erro ao buscar perfil do artista:", erro);
+        res.status(500).json({ erro: "Erro interno no servidor ao montar o perfil: " + erro.message });
     }
 });
 
