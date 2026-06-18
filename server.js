@@ -4,9 +4,29 @@ const helmet = require('helmet');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg'); 
 const jwt = require('jsonwebtoken'); 
+// Configuração do Multer para gerenciar upload de arquivos locais
+const multer = require('multer');
+const path = require('path');
 
+// 1. PRIMEIRO INICIAMOS O APP DO EXPRESS
 const app = express();
 
+// 2. CONFIGURAÇÃO DO STORAGE DO MULTER
+const configuracaoArmazenamento = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, 'uploads/'); // Os arquivos salvos vão para uma pasta chamada 'uploads'
+    },
+    filename: (req, file, cb) => {
+        // Renomeia o arquivo para evitar que nomes duplicados se sobrescrevam
+        const sufixoUnico = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, sufixoUnico + path.extname(file.originalname));
+    }
+});
+
+const upload = multer({ storage: configuracaoArmazenamento });
+
+// 3. AGORA AS MIDDLEWARES CONSEGUEM USAR O 'APP' SEM DAR ERRO
+app.use('/uploads', express.static('uploads'));
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
@@ -139,20 +159,23 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // =========================================================================
-// 🖼️ ROTA: CRIAR POST DE CONTEÚDO (POSTAGEM PROTEGIDA)
+// 🖼️ ROTA: CRIAR POST DE CONTEÚDO (POSTAGEM PROTEGIDA COM UPLOAD REAL)
 // =========================================================================
-app.post('/api/conteudos/criar', conferirAutenticacao, async (req, res) => {
-    const { titulo, descricao, midia_url } = req.body;
-    const usuarioId = req.usuarioLogado.id; // Puxado automaticamente do Token seguro
+app.post('/api/conteudos/criar', conferirAutenticacao, upload.single('imagem'), async (req, res) => {
+    const { titulo, descricao } = req.body;
+    const usuarioId = req.usuarioLogado.id;
 
-    if (!titulo || !midia_url) {
-        return res.status(400).json({ erro: "O título e a URL da mídia são obrigatórios!" });
+    // Se o usuário mandou um arquivo físico, usamos o caminho dele. Se não mandou, checa se veio uma URL por texto.
+    let urlFinalDaMidia = req.file ? `/uploads/${req.file.filename}` : req.body.midia_url;
+
+    if (!titulo || !urlFinalDaMidia) {
+        return res.status(400).json({ erro: "O título e o arquivo de imagem (ou URL) são obrigatórios!" });
     }
 
     try {
         const novoPost = await banco.query(
             'INSERT INTO conteudos (usuario_id, titulo, descricao, midia_url) VALUES ($1, $2, $3, $4) RETURNING *',
-            [usuarioId, titulo, descricao, midia_url]
+            [usuarioId, titulo, descricao, urlFinalDaMidia]
         );
 
         res.status(201).json({
@@ -189,6 +212,107 @@ app.post('/api/redes-sociais', conferirAutenticacao, async (req, res) => {
 
     } catch (erro) {
         res.status(500).json({ erro: "Erro ao salvar rede social: " + erro.message });
+    }
+});
+
+// =========================================================================
+// 🎨 ROTA: ATUALIZAR PREFERÊNCIAS DE LAYOUT (PROTEGIDA)
+// =========================================================================
+app.put('/api/preferencias-layout', conferirAutenticacao, async (req, res) => {
+    const { cor_fundo, cor_acento, estilo_card } = req.body;
+    const usuarioId = req.usuarioLogado.id; // Pega o ID do artista direto do token seguro
+
+    // Validação básica opcional para garantir integridade dos dados
+    if (cor_fundo && cor_fundo.length !== 7) {
+        return res.status(400).json({ erro: "A cor de fundo deve ser um código hexadecimal válido (ex: #FFFFFF)!" });
+    }
+    if (cor_acento && cor_acento.length !== 7) {
+        return res.status(400).json({ erro: "A cor de acento deve ser um código hexadecimal válido (ex: #007BFF)!" });
+    }
+
+    try {
+        // Aktualiza os registros baseados no ID do usuário logado
+        const layoutAtualizado = await banco.query(
+            `UPDATE preferencias_layout 
+             SET cor_fundo = COALESCE($1, cor_fundo), 
+                 cor_acento = COALESCE($2, cor_acento), 
+                 estilo_card = COALESCE($3, estilo_card)
+             WHERE usuario_id = $4 RETURNING *`,
+            [cor_fundo, cor_acento, estilo_card, usuarioId]
+        );
+
+        if (layoutAtualizado.rows.length === 0) {
+            return res.status(404).json({ erro: "Configurações de layout não encontradas para este usuário." });
+        }
+
+        res.json({
+            mensagem: "Visual do portfólio updated com sucesso!",
+            layout: layoutAtualizado.rows[0]
+        });
+
+    } catch (erro) {
+        res.status(500).json({ erro: "Erro ao atualizar preferências de layout: " + erro.message });
+    }
+});
+
+// =========================================================================
+// ✏️ ROTA: EDITAR POSTAGEM DE CONTEÚDO (PROTEGIDA)
+// =========================================================================
+app.put('/api/conteudos/:id', conferirAutenticacao, async (req, res) => {
+    const idPost = req.params.id; // Pega o ID do post vindo na URL (ex: /api/conteudos/5)
+    const { titulo, descricao, midia_url } = req.body;
+    const usuarioId = req.usuarioLogado.id; // ID do usuário vindo do token seguro
+
+    try {
+        // Primeiro, atualiza o post APENAS se ele pertencer ao usuário logado
+        const postAtualizado = await banco.query(
+            `UPDATE conteudos 
+             SET titulo = COALESCE($1, titulo),
+                 descricao = COALESCE($2, descricao),
+                 midia_url = COALESCE($3, midia_url)
+             WHERE id = $4 AND usuario_id = $5 RETURNING *`,
+            [titulo, descricao, midia_url, idPost, usuarioId]
+        );
+
+        // Se não retornou nenhuma linha, ou o post não existe ou não pertence a quem está logado
+        if (postAtualizado.rows.length === 0) {
+            return res.status(403).json({ erro: "Ação não autorizada ou postagem não encontrada!" });
+        }
+
+        res.json({
+            mensagem: "Publicação editada com sucesso!",
+            post: postAtualizado.rows[0]
+        });
+
+    } catch (erro) {
+        res.status(500).json({ erro: "Erro ao editar postagem: " + erro.message });
+    }
+});
+
+// =========================================================================
+// 🗑️ ROTA: DELETAR POSTAGEM DE CONTEÚDO (PROTEGIDA)
+// =========================================================================
+app.delete('/api/conteudos/:id', conferirAutenticacao, async (req, res) => {
+    const idPost = req.params.id;
+    const usuarioId = req.usuarioLogado.id;
+
+    try {
+        // Deleta o post APENAS se o id coincidir e pertencer ao criador
+        const resultadoDelecao = await banco.query(
+            'DELETE FROM conteudos WHERE id = $1 AND usuario_id = $2 RETURNING *',
+            [idPost, usuarioId]
+        );
+
+        if (resultadoDelecao.rows.length === 0) {
+            return res.status(403).json({ erro: "Ação não autorizada ou postagem não encontrada!" });
+        }
+
+        res.json({
+            mensagem: "Publicação removida com sucesso do PortArt!"
+        });
+
+    } catch (erro) {
+        res.status(500).json({ erro: "Erro ao deletar postagem: " + erro.message });
     }
 });
 
