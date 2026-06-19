@@ -248,7 +248,7 @@ app.put('/api/preferencias-layout', conferirAutenticacao, async (req, res) => {
     }
 
     try {
-        // Atualiza os registros baseados no ID do usuário logado
+        // Aktualiza os registros baseados no ID do usuário logado
         const layoutAtualizado = await banco.query(
             `UPDATE preferencias_layout 
              SET cor_fundo = COALESCE($1, cor_fundo), 
@@ -348,6 +348,45 @@ app.post('/api/conteudos/:id/curtir', conferirAutenticacao, async (req, res) => 
 });
 
 // =========================================================================
+// ❤️ ROTA: LISTAR TODAS AS ARTES CURTIDAS/FAVORITADAS PELO USUÁRIO (PROTEGIDA)
+// =========================================================================
+app.get('/api/usuarios/meus-favoritos', conferirAutenticacao, async (req, res) => {
+    const usuarioLogadoId = req.usuarioLogado.id; 
+
+    try {
+        const query = `
+            SELECT 
+                curtidas.id AS curtida_id,
+                curtidas.data_curtida,
+                conteudos.id AS post_id,
+                conteudos.titulo,
+                conteudos.descricao,
+                conteudos.midia_url,
+                conteudos.data_publicacao,
+                autor.nome AS nome_artista_autor,
+                autor.foto_perfil AS foto_artista_autor
+            FROM curtidas
+            JOIN conteudos ON curtidas.conteudo_id = conteudos.id
+            JOIN usuarios autor ON conteudos.usuario_id = autor.id
+            WHERE curtidas.usuario_id = $1
+            ORDER BY curtidas.data_curtida DESC
+        `;
+
+        const resultado = await banco.query(query, [usuarioLogadoId]);
+
+        res.json({
+            status: "Sucesso",
+            totalFavoritos: resultado.rows.length,
+            favoritos: resultado.rows
+        });
+
+    } catch (erro) {
+        console.error("Erro ao buscar favoritos:", erro);
+        res.status(500).json({ erro: "Erro interno ao buscar sua lista de favoritos: " + erro.message });
+    }
+});
+
+// =========================================================================
 // 🗑️ ROTA: DELETAR POSTAGEM DE CONTEÚDO (PROTEGIDA)
 // =========================================================================
 app.delete('/api/conteudos/:id', conferirAutenticacao, async (req, res) => {
@@ -384,7 +423,6 @@ const storageAvatar = multer.diskStorage({
         cb(null, 'uploads/avatares/'); // Salva na pasta que já está criada ali no seu projeto
     },
     filename: (req, file, cb) => {
-        // Ajustado para capturar corretamente do req.usuarioLogado.id
         const extensao = path.extname(file.originalname);
         cb(null, `avatar-${req.usuarioLogado.id}-${Date.now()}${extensao}`);
     }
@@ -395,22 +433,19 @@ const uploadAvatar = multer({ storage: storageAvatar });
 // 2. Rota PUT protegida usando seu middleware 'conferirAutenticacao'
 app.put('/api/usuarios/avatar', conferirAutenticacao, uploadAvatar.single('avatar'), async (req, res) => {
     try {
-        // Se o usuário não enviou nenhum arquivo no Postman
         if (!req.file) {
             return res.status(400).json({ erro: "Nenhum arquivo de imagem foi enviado!" });
         }
 
-        // Padroniza o caminho do arquivo para salvar na tabela
         const caminhoFoto = `/uploads/avatares/${req.file.filename}`;
 
-        // Atualiza usando o seu objeto 'banco' e o id correto vindo do token
         const query = 'UPDATE usuarios SET foto_perfil = $1 WHERE id = $2 RETURNING id, nome, foto_perfil';
         const valores = [caminhoFoto, req.usuarioLogado.id]; 
         
         const resultado = await banco.query(query, valores);
 
         return res.status(200).json({
-            mensagem: "Foto de perfil atualizada com sucesso!",
+            mensagem: "Foto de perfil updated com sucesso!",
             usuario: resultado.rows[0]
         });
 
@@ -447,7 +482,7 @@ app.get('/api/conteudos', async (req, res) => {
             GROUP BY conteudos.id, usuarios.nome
             ORDER BY conteudos.data_publicacao DESC
             LIMIT $1 OFFSET $2
-        `, [limitePorPagina, quantidadeParaPular]);
+        `, [limitePorPagina, quantityParaPular || quantidadeParaPular]);
 
         const totalPaginas = Math.ceil(totalDePostagens / limitePorPagina);
 
@@ -474,7 +509,6 @@ app.get('/api/usuarios/:id', async (req, res) => {
     const idArtista = req.params.id;
 
     try {
-        // 1. Busca os dados públicos básicos do artista (Atualizado para incluir foto_perfil)
         const usuarioQuery = await banco.query(
             'SELECT id, nome, bio, foto_perfil, data_criacao FROM usuarios WHERE id = $1',
             [idArtista]
@@ -486,19 +520,16 @@ app.get('/api/usuarios/:id', async (req, res) => {
 
         const artista = usuarioQuery.rows[0];
 
-        // 2. Busca as preferências de layout dele (cores e estilo)
         const layoutQuery = await banco.query(
             'SELECT cor_fundo, cor_acento, estilo_card FROM preferencias_layout WHERE usuario_id = $1',
             [idArtista]
         );
 
-        // 3. Busca as redes sociais vinculadas por ele
         const redesQuery = await banco.query(
             'SELECT id, nome_plataforma, perfil_url FROM redes_sociais WHERE usuario_id = $1',
             [idArtista]
         );
 
-        // 4. Busca todas as publicações/artes desse artista específico
         const conteudosQuery = await banco.query(`
             SELECT 
                 conteudos.id, 
