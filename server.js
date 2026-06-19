@@ -11,7 +11,7 @@ const path = require('path');
 // 1. PRIMEIRO INICIAMOS O APP DO EXPRESS
 const app = express();
 
-// 2. CONFIGURAÇÃO DO STORAGE DO MULTER
+// 2. CONFIGURAÇÃO DO STORAGE DO MULTER PARA POSTAGENS
 const configuracaoArmazenamento = multer.diskStorage({
     destination: (req, file, cb) => {
         cb(null, 'uploads/'); // Os arquivos salvos vão para uma pasta chamada 'uploads'
@@ -248,7 +248,7 @@ app.put('/api/preferencias-layout', conferirAutenticacao, async (req, res) => {
     }
 
     try {
-        // Aktualiza os registros baseados no ID do usuário logado
+        // Atualiza os registros baseados no ID do usuário logado
         const layoutAtualizado = await banco.query(
             `UPDATE preferencias_layout 
              SET cor_fundo = COALESCE($1, cor_fundo), 
@@ -375,6 +375,52 @@ app.delete('/api/conteudos/:id', conferirAutenticacao, async (req, res) => {
 });
 
 // =========================================================================
+// 👤 ROTA DE ATUALIZAÇÃO DO AVATAR DO USUÁRIO (FOTO DE PERFIL)
+// =========================================================================
+
+// 1. Configuração do Multer específica para Avatares
+const storageAvatar = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, 'uploads/avatares/'); // Salva na pasta que já está criada ali no seu projeto
+    },
+    filename: (req, file, cb) => {
+        // Ajustado para capturar corretamente do req.usuarioLogado.id
+        const extensao = path.extname(file.originalname);
+        cb(null, `avatar-${req.usuarioLogado.id}-${Date.now()}${extensao}`);
+    }
+});
+
+const uploadAvatar = multer({ storage: storageAvatar });
+
+// 2. Rota PUT protegida usando seu middleware 'conferirAutenticacao'
+app.put('/api/usuarios/avatar', conferirAutenticacao, uploadAvatar.single('avatar'), async (req, res) => {
+    try {
+        // Se o usuário não enviou nenhum arquivo no Postman
+        if (!req.file) {
+            return res.status(400).json({ erro: "Nenhum arquivo de imagem foi enviado!" });
+        }
+
+        // Padroniza o caminho do arquivo para salvar na tabela
+        const caminhoFoto = `/uploads/avatares/${req.file.filename}`;
+
+        // Atualiza usando o seu objeto 'banco' e o id correto vindo do token
+        const query = 'UPDATE usuarios SET foto_perfil = $1 WHERE id = $2 RETURNING id, nome, foto_perfil';
+        const valores = [caminhoFoto, req.usuarioLogado.id]; 
+        
+        const resultado = await banco.query(query, valores);
+
+        return res.status(200).json({
+            mensagem: "Foto de perfil atualizada com sucesso!",
+            usuario: resultado.rows[0]
+        });
+
+    } catch (erro) {
+        console.error("Erro ao atualizar avatar:", erro);
+        return res.status(500).json({ erro: "Erro ao salvar a foto de perfil: " + erro.message });
+    }
+});
+
+// =========================================================================
 // 🚀 ROTA DE LEITURA PÚBLICA DE CONTEÚDOS COM PAGINAÇÃO E LIKES
 // =========================================================================
 app.get('/api/conteudos', async (req, res) => {
@@ -428,9 +474,9 @@ app.get('/api/usuarios/:id', async (req, res) => {
     const idArtista = req.params.id;
 
     try {
-        // 1. Busca os dados públicos básicos do artista
+        // 1. Busca os dados públicos básicos do artista (Atualizado para incluir foto_perfil)
         const usuarioQuery = await banco.query(
-            'SELECT id, nome, bio, data_criacao FROM usuarios WHERE id = $1',
+            'SELECT id, nome, bio, foto_perfil, data_criacao FROM usuarios WHERE id = $1',
             [idArtista]
         );
 
@@ -452,7 +498,7 @@ app.get('/api/usuarios/:id', async (req, res) => {
             [idArtista]
         );
 
-        // 4. Busca todas as publicações/artes desse artista específico (Atualizado com total_curtidas!)
+        // 4. Busca todas as publicações/artes desse artista específico
         const conteudosQuery = await banco.query(`
             SELECT 
                 conteudos.id, 
